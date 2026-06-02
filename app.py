@@ -45,6 +45,8 @@ def fetch_restaurants():
     url = "https://dapi.kakao.com/v2/local/search/category.json"
     headers = {"Authorization": f"KakaoAK {KAKAO_REST_API_KEY}"}
     restaurants = []
+    last_status = None
+    last_body = None
     for page in range(1, 4):
         params = {
             "category_group_code": "FD6",
@@ -56,6 +58,8 @@ def fetch_restaurants():
             "sort": "distance",
         }
         res = requests.get(url, headers=headers, params=params, timeout=5)
+        last_status = res.status_code
+        last_body = res.text[:200]
         if res.status_code != 200:
             break
         data = res.json()
@@ -68,7 +72,8 @@ def fetch_restaurants():
         combined = r.get("category_name", "") + r.get("place_name", "")
         if not any(kw in combined for kw in HEAVY_KEYWORDS):
             filtered.append(r)
-    return filtered if filtered else restaurants
+    result = filtered if filtered else restaurants
+    return result, last_status, last_body
 
 
 def build_response(place):
@@ -94,11 +99,11 @@ def lunch():
     if not verify_slack_signature(request):
         return jsonify({"error": "Invalid signature"}), 403
     try:
-        restaurants = fetch_restaurants()
+        restaurants, status, body = fetch_restaurants()
     except Exception as e:
         return jsonify({"response_type": "ephemeral", "text": f"오류: {e}"})
     if not restaurants:
-        return jsonify({"response_type": "ephemeral", "text": "근처 음식점을 찾지 못했어요."})
+        return jsonify({"response_type": "ephemeral", "text": f"음식점 없음. API 상태: {status}, 응답: {body}"})
     pick = random.choice(restaurants)
     return jsonify(build_response(pick))
 
