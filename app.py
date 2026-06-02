@@ -3,6 +3,7 @@ import random
 import hashlib
 import hmac
 import time
+import threading
 import requests
 from flask import Flask, request, jsonify
 
@@ -24,29 +25,10 @@ HEAVY_KEYWORDS = [
 ]
 
 
-def verify_slack_signature(req):
-    if not SLACK_SIGNING_SECRET:
-        return True
-    ts = req.headers.get("X-Slack-Request-Timestamp", "")
-    if abs(time.time() - float(ts)) > 300:
-        return False
-    body = req.get_data(as_text=True)
-    sig_base = f"v0:{ts}:{body}"
-    my_sig = "v0=" + hmac.new(
-        SLACK_SIGNING_SECRET.encode(),
-        sig_base.encode(),
-        hashlib.sha256
-    ).hexdigest()
-    slack_sig = req.headers.get("X-Slack-Signature", "")
-    return hmac.compare_digest(my_sig, slack_sig)
-
-
 def fetch_restaurants():
     url = "https://dapi.kakao.com/v2/local/search/category.json"
     headers = {"Authorization": f"KakaoAK {KAKAO_REST_API_KEY}"}
     restaurants = []
-    last_status = None
-    last_body = None
     for page in range(1, 4):
         params = {
             "category_group_code": "FD6",
@@ -57,26 +39,22 @@ def fetch_restaurants():
             "page": page,
             "sort": "distance",
         }
-        res = requests.get(url, headers=headers, params=params, timeout=5)
-        last_status = res.status_code
-        last_body = res.text[:200]
+        res = requests.get(url, headers=headers, params=params, timeout=10)
         if res.status_code != 200:
-            break
+            raise Exception(f"Kakao API {res.status_code}: {res.text[:100]}")
         data = res.json()
         docs = data.get("documents", [])
         restaurants.extend(docs)
         if data.get("meta", {}).get("is_end"):
             break
-    filtered = []
-    for r in restaurants:
-        combined = r.get("category_name", "") + r.get("place_name", "")
-        if not any(kw in combined for kw in HEAVY_KEYWORDS):
-            filtered.append(r)
-    result = filtered if filtered else restaurants
-    return result, last_status, last_body
+    filtered = [
+        r for r in restaurants
+        if not any(kw in r.get("category_name", "") + r.get("place_name", "") for kw in HEAVY_KEYWORDS)
+    ]
+    return filtered if filtered else restaurants
 
 
-def build_response(place):
+def build_text(place):
     name = place.get("place_name", "알 수 없음")
     category = place.get("category_name", "").split(" > ")[-1]
     address = place.get("road_address_name") or place.get("address_name", "")
@@ -84,28 +62,35 @@ def build_response(place):
     url = place.get("place_url", "")
     phone = place.get("phone", "전화번호 없음")
     dist_text = f"{int(distance)}m" if distance else "거리 미상"
-    text = (
+    return (
         f"오늘 점심은 여기 어때요?\n\n"
         f"*{name}* ({category})\n"
         f"{address} ({dist_text})\n"
         f"{phone}\n"
         f"<{url}|카카오맵에서 보기>"
     )
-    return {"response_type": "in_channel", "text": text}
+
+
+def process_lunch(response_url):
+    try:
+        restaurants = fetch_restaurants()
+        if not restaurants:
+            text = "근처 음식점을 찾지 못했어요."
+        else:
+            text = build_text(random.choice(restaurants))
+        payload = {"response_type": "in_channel", "text": text}
+    except Exception as e:
+        payload = {"response_type": "ephemeral", "text": f"오류: {e}"}
+    requests.post(response_url, json=payload, timeout=10)
 
 
 @app.route("/lunch", methods=["POST"])
 def lunch():
-    if not verify_slack_signature(request):
-        return jsonify({"error": "Invalid signature"}), 403
-    try:
-        restaurants, status, body = fetch_restaurants()
-    except Exception as e:
-        return jsonify({"response_type": "ephemeral", "text": f"오류: {e}"})
-    if not restaurants:
-        return jsonify({"response_type": "ephemeral", "text": f"음식점 없음. API 상태: {status}, 응답: {body}"})
-    pick = random.choice(restaurants)
-    return jsonify(build_response(pick))
+    response_url = request.form.get("response_url")
+    t = threading.Thread(target=process_lunch, args=(response_url,))
+    t.daemon = True
+    t.start()
+    return "", 200
 
 
 @app.route("/", methods=["GET"])
